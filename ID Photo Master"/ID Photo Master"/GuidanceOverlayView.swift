@@ -138,56 +138,21 @@ struct GuidanceOverlayView: View {
                     .frame(width: frame.width, height: frame.height)
                     .position(x: frame.midX, y: frame.midY)
                 
-                // 头部和肩部轮廓
-                HeadAndShouldersShape()
-                    .stroke(Color.blue.opacity(0.3), lineWidth: 2)
-                    .frame(width: frame.width * 0.7, height: frame.height * 0.8)
-                    .position(x: frame.midX, y: frame.midY)
+                // 静态参考轮廓（完全固定，不随人脸移动）
+                StaticReferenceSilhouette()
+                    .stroke(
+                        Color.white.opacity(0.5),
+                        style: StrokeStyle(lineWidth: 3, lineCap: .round, lineJoin: .round, dash: [10, 5])
+                    )
+                    .frame(width: geometry.size.width * 0.60, height: geometry.size.width * 0.60 * 1.35)
+                    .position(
+                        x: geometry.size.width / 2,
+                        y: geometry.size.height * 0.15 + (geometry.size.width * 0.60 * 1.35) / 2
+                    )
                 
-                // 动态弧形光圈
-                ArcSegment(center: center, radius: arcRadius, 
-                          startAngle: .degrees(60), endAngle: .degrees(120),
-                          state: topArcState, animationProgress: arcAnimationProgress)
-                    .stroke(lineWidth: arcWidth)
-                
-                ArcSegment(center: center, radius: arcRadius,
-                          startAngle: .degrees(120), endAngle: .degrees(180),
-                          state: leftArcState, animationProgress: arcAnimationProgress)
-                    .stroke(lineWidth: arcWidth)
-                
-                ArcSegment(center: center, radius: arcRadius,
-                          startAngle: .degrees(240), endAngle: .degrees(300),
-                          state: bottomArcState, animationProgress: arcAnimationProgress)
-                    .stroke(lineWidth: arcWidth)
-                
-                ArcSegment(center: center, radius: arcRadius,
-                          startAngle: .degrees(300), endAngle: .degrees(360),
-                          state: rightArcState, animationProgress: arcAnimationProgress)
-                    .stroke(lineWidth: arcWidth)
-                
-                // 人脸边界框（如果检测到）
-                if let faceBox = faceBoundingBox {
-                    Rectangle()
-                        .stroke(Color.yellow, lineWidth: 2)
-                        .frame(width: faceBox.width, height: faceBox.height)
-                        .position(x: faceBox.midX, y: faceBox.midY)
-                }
-                
-                // 角度指示器
-                VStack {
-                    Spacer()
-                        .frame(height: frame.maxY + 20)
-                
-                HStack(spacing: 30) {
-                    AngleIndicator(angle: yawAngle, label: "左右偏转", 
-                                  perfectRange: -3...3, unit: "度")
-                    AngleIndicator(angle: rollAngle, label: "头部倾斜",
-                                  perfectRange: -3...3, unit: "度")
-                    AngleIndicator(angle: pitchAngle, label: "抬头低头",
-                                  perfectRange: -3...3, unit: "度")
-                    }
-                    .padding(.horizontal)
-                }
+                // 🧹 已移除：动态弧形光圈（调试用）
+                // 🧹 已移除：人脸边界框（调试用）
+                // 🧹 已移除：角度指示器（调试用）
             }
             .onAppear {
                 // 启动弧段动画
@@ -209,27 +174,255 @@ struct GuidanceOverlayView: View {
     }
 }
 
-// MARK: - 头部和肩部形状
+// MARK: - 静态参考轮廓（完全固定，不接受任何检测输入）
+struct StaticReferenceSilhouette: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        
+        let w = rect.width
+        let h = rect.height
+        let cx = rect.midX
+        
+        // 固定的标准证件照比例（基于屏幕坐标系）
+        let headTop = h * 0.08           // 头顶位置
+        let headWidth = w * 0.52         // 头部宽度
+        let headHeight = h * 0.42        // 头部高度
+        
+        // 颈部
+        let neckTop = headTop + headHeight
+        let neckWidth = w * 0.22
+        let neckHeight = h * 0.10
+        
+        // 肩膀
+        let shoulderTop = neckTop + neckHeight
+        let shoulderWidth = w * 0.70
+        let shoulderHeight = h * 0.15
+        
+        // 绘制头部椭圆
+        let headRect = CGRect(
+            x: cx - headWidth/2,
+            y: headTop,
+            width: headWidth,
+            height: headHeight
+        )
+        path.addEllipse(in: headRect)
+        
+        // 绘制颈部和肩膀（开放式）
+        // 左肩
+        path.move(to: CGPoint(x: cx - shoulderWidth/2, y: shoulderTop + shoulderHeight))
+        
+        // 左肩到左颈
+        path.addQuadCurve(
+            to: CGPoint(x: cx - neckWidth/2, y: neckTop),
+            control: CGPoint(x: cx - shoulderWidth * 0.38, y: shoulderTop + shoulderHeight * 0.5)
+        )
+        
+        // 左颈（短直线）
+        path.addLine(to: CGPoint(x: cx - neckWidth/2, y: neckTop - neckHeight * 0.2))
+        
+        // 右颈（对称）
+        path.move(to: CGPoint(x: cx + neckWidth/2, y: neckTop - neckHeight * 0.2))
+        path.addLine(to: CGPoint(x: cx + neckWidth/2, y: neckTop))
+        
+        // 右颈到右肩
+        path.addQuadCurve(
+            to: CGPoint(x: cx + shoulderWidth/2, y: shoulderTop + shoulderHeight),
+            control: CGPoint(x: cx + shoulderWidth * 0.38, y: shoulderTop + shoulderHeight * 0.5)
+        )
+        
+        return path
+    }
+}
+
+// MARK: - ICAO 标准引导框（符合国际证件照标准）
+struct ICAOGuidanceShape: Shape {
+    func path(in rect: CGRect) -> Path {
+        var path = Path()
+        
+        let w = rect.width
+        let h = rect.height
+        let cx = rect.midX
+        
+        // ICAO 标准比例：
+        // - 轮廓高度占屏幕 55%
+        // - 头顶距离顶端 12%
+        // - 头部是椭圆形
+        // - 底部开放式，暗示需要露出肩膀
+        
+        // 头部椭圆参数
+        let headTop = h * 0.12           // 头顶留白12%
+        let headWidth = w * 0.50         // 头部宽度
+        let headHeight = h * 0.42        // 头部高度（椭圆）
+        
+        // 耳朵标记位置
+        let earY = headTop + headHeight * 0.45  // 耳朵在头部中间偏上
+        let earRadius = w * 0.025        // 耳朵标记半径
+        
+        // 颈部和肩膀
+        let neckTop = headTop + headHeight
+        let neckWidth = w * 0.22
+        let shoulderTop = neckTop + h * 0.08
+        let shoulderWidth = w * 0.70
+        
+        // 绘制头部椭圆
+        let headRect = CGRect(
+            x: cx - headWidth/2,
+            y: headTop,
+            width: headWidth,
+            height: headHeight
+        )
+        path.addEllipse(in: headRect)
+        
+        // 绘制左耳标记（小半圆）
+        path.addArc(
+            center: CGPoint(x: cx - headWidth/2, y: earY),
+            radius: earRadius,
+            startAngle: .degrees(90),
+            endAngle: .degrees(270),
+            clockwise: false
+        )
+        
+        // 绘制右耳标记（小半圆）
+        path.addArc(
+            center: CGPoint(x: cx + headWidth/2, y: earY),
+            radius: earRadius,
+            startAngle: .degrees(270),
+            endAngle: .degrees(90),
+            clockwise: false
+        )
+        
+        // 绘制颈部和肩膀轮廓（开放式倒U形）
+        // 从左肩开始
+        path.move(to: CGPoint(x: cx - shoulderWidth/2, y: shoulderTop + h * 0.15))
+        
+        // 左肩到左颈
+        path.addQuadCurve(
+            to: CGPoint(x: cx - neckWidth/2, y: neckTop),
+            control: CGPoint(x: cx - shoulderWidth * 0.35, y: shoulderTop)
+        )
+        
+        // 左颈（短直线）
+        path.addLine(to: CGPoint(x: cx - neckWidth/2, y: neckTop - h * 0.02))
+        
+        // 右颈（对称）
+        path.move(to: CGPoint(x: cx + neckWidth/2, y: neckTop - h * 0.02))
+        path.addLine(to: CGPoint(x: cx + neckWidth/2, y: neckTop))
+        
+        // 右颈到右肩
+        path.addQuadCurve(
+            to: CGPoint(x: cx + shoulderWidth/2, y: shoulderTop + h * 0.15),
+            control: CGPoint(x: cx + shoulderWidth * 0.35, y: shoulderTop)
+        )
+        
+        return path
+    }
+}
+
+// MARK: - 原有的头部和肩部形状（保留作为备用）
 struct HeadAndShouldersShape: Shape {
     func path(in rect: CGRect) -> Path {
         var path = Path()
         
-        // 头部（椭圆形）
-        let headRect = CGRect(x: rect.width * 0.2, y: rect.height * 0.1,
-                            width: rect.width * 0.6, height: rect.height * 0.5)
-        path.addEllipse(in: headRect)
+        let w = rect.width
+        let h = rect.height
+        let cx = rect.midX
         
-        // 肩部（梯形）
-        let shoulderTopY = headRect.maxY
-        let shoulderBottomY = rect.maxY
-        let shoulderTopWidth = rect.width * 0.4
-        let shoulderBottomWidth = rect.width * 0.8
+        // 参考图的关键点位置（精确测量）
+        // 从左肩开始，逆时针绘制完整轮廓
         
-        path.move(to: CGPoint(x: rect.midX - shoulderTopWidth/2, y: shoulderTopY))
-        path.addLine(to: CGPoint(x: rect.midX - shoulderBottomWidth/2, y: shoulderBottomY))
-        path.addLine(to: CGPoint(x: rect.midX + shoulderBottomWidth/2, y: shoulderBottomY))
-        path.addLine(to: CGPoint(x: rect.midX + shoulderTopWidth/2, y: shoulderTopY))
-        path.closeSubpath()
+        // 左肩起点
+        path.move(to: CGPoint(x: cx - w * 0.47, y: h * 0.88))
+        
+        // 左肩到左颈（大弧线）
+        path.addCurve(
+            to: CGPoint(x: cx - w * 0.13, y: h * 0.62),
+            control1: CGPoint(x: cx - w * 0.42, y: h * 0.78),
+            control2: CGPoint(x: cx - w * 0.20, y: h * 0.68)
+        )
+        
+        // 左颈（直线）
+        path.addLine(to: CGPoint(x: cx - w * 0.13, y: h * 0.53))
+        
+        // 左下巴（圆润过渡）
+        path.addCurve(
+            to: CGPoint(x: cx, y: h * 0.545),
+            control1: CGPoint(x: cx - w * 0.10, y: h * 0.535),
+            control2: CGPoint(x: cx - w * 0.05, y: h * 0.545)
+        )
+        
+        // 右下巴（对称）
+        path.addCurve(
+            to: CGPoint(x: cx + w * 0.13, y: h * 0.53),
+            control1: CGPoint(x: cx + w * 0.05, y: h * 0.545),
+            control2: CGPoint(x: cx + w * 0.10, y: h * 0.535)
+        )
+        
+        // 右颈（直线）
+        path.addLine(to: CGPoint(x: cx + w * 0.13, y: h * 0.62))
+        
+        // 右颈到右肩（大弧线）
+        path.addCurve(
+            to: CGPoint(x: cx + w * 0.47, y: h * 0.88),
+            control1: CGPoint(x: cx + w * 0.20, y: h * 0.68),
+            control2: CGPoint(x: cx + w * 0.42, y: h * 0.78)
+        )
+        
+        // 头部轮廓（新路径，从右下巴开始）
+        path.move(to: CGPoint(x: cx + w * 0.13, y: h * 0.53))
+        
+        // 右脸颊（平滑曲线）
+        path.addCurve(
+            to: CGPoint(x: cx + w * 0.24, y: h * 0.38),
+            control1: CGPoint(x: cx + w * 0.20, y: h * 0.47),
+            control2: CGPoint(x: cx + w * 0.24, y: h * 0.42)
+        )
+        
+        // 右耳朵（小凸起）
+        path.addCurve(
+            to: CGPoint(x: cx + w * 0.27, y: h * 0.32),
+            control1: CGPoint(x: cx + w * 0.26, y: h * 0.36),
+            control2: CGPoint(x: cx + w * 0.27, y: h * 0.34)
+        )
+        
+        path.addCurve(
+            to: CGPoint(x: cx + w * 0.24, y: h * 0.26),
+            control1: CGPoint(x: cx + w * 0.27, y: h * 0.30),
+            control2: CGPoint(x: cx + w * 0.26, y: h * 0.28)
+        )
+        
+        // 右侧头部（从耳朵到头顶）
+        path.addCurve(
+            to: CGPoint(x: cx, y: h * 0.08),
+            control1: CGPoint(x: cx + w * 0.24, y: h * 0.18),
+            control2: CGPoint(x: cx + w * 0.15, y: h * 0.08)
+        )
+        
+        // 左侧头部（从头顶到耳朵，对称）
+        path.addCurve(
+            to: CGPoint(x: cx - w * 0.24, y: h * 0.26),
+            control1: CGPoint(x: cx - w * 0.15, y: h * 0.08),
+            control2: CGPoint(x: cx - w * 0.24, y: h * 0.18)
+        )
+        
+        // 左耳朵（对称）
+        path.addCurve(
+            to: CGPoint(x: cx - w * 0.27, y: h * 0.32),
+            control1: CGPoint(x: cx - w * 0.26, y: h * 0.28),
+            control2: CGPoint(x: cx - w * 0.27, y: h * 0.30)
+        )
+        
+        path.addCurve(
+            to: CGPoint(x: cx - w * 0.24, y: h * 0.38),
+            control1: CGPoint(x: cx - w * 0.27, y: h * 0.34),
+            control2: CGPoint(x: cx - w * 0.26, y: h * 0.36)
+        )
+        
+        // 左脸颊（平滑曲线）
+        path.addCurve(
+            to: CGPoint(x: cx - w * 0.13, y: h * 0.53),
+            control1: CGPoint(x: cx - w * 0.24, y: h * 0.42),
+            control2: CGPoint(x: cx - w * 0.20, y: h * 0.47)
+        )
         
         return path
     }

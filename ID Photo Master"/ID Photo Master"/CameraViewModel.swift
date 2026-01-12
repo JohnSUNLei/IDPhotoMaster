@@ -12,10 +12,11 @@ import Combine
 
 /// 面部检测数据模型
 struct FaceDetectionData {
-    let boundingBox: CGRect
-    let yaw: Double?      // 左右偏转角度（弧度）
-    let roll: Double?     // 歪头角度（弧度）
-    let pitch: Double?    // 抬头/低头角度（估算）
+    let boundingBox: CGRect              // 屏幕坐标（用于UI显示）
+    let normalizedBoundingBox: CGRect    // 归一化坐标（0.0~1.0，用于ICAO校验）
+    let yaw: Double?                     // 左右偏转角度（弧度）
+    let roll: Double?                    // 歪头角度（弧度）
+    let pitch: Double?                   // 抬头/低头角度（估算）
     let faceLandmarks: VNFaceLandmarks2D?
 }
 
@@ -271,12 +272,16 @@ extension CameraViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
         let roll = face.roll?.doubleValue
         let pitch = calculatePitch(from: landmarks)
         
-        // 转换边界框到屏幕坐标
-        let boundingBox = convertBoundingBox(face.boundingBox)
+        // 重构更大的边界框（基于特征点）
+        let expandedBoundingBox = reconstructBoundingBox(from: face, landmarks: landmarks)
         
-        // 创建检测数据
+        // 转换边界框到屏幕坐标
+        let screenBoundingBox = convertBoundingBox(expandedBoundingBox)
+        
+        // 创建检测数据（同时保存归一化坐标）
         let detectionData = FaceDetectionData(
-            boundingBox: boundingBox,
+            boundingBox: screenBoundingBox,
+            normalizedBoundingBox: expandedBoundingBox,  // 使用扩展后的归一化坐标
             yaw: yaw,
             roll: roll,
             pitch: pitch,
@@ -335,17 +340,111 @@ extension CameraViewModel: AVCaptureVideoDataOutputSampleBufferDelegate {
         return pitch
     }
     
-    // MARK: - 转换边界框到屏幕坐标
+    // MARK: - 重构边界框（基于特征点扩展）
+    /// 利用面部特征点重新构建一个更大、更准确的边界框
+    private func reconstructBoundingBox(from face: VNFaceObservation, landmarks: VNFaceObservation?) -> CGRect {
+        var minX = face.boundingBox.minX
+        var maxX = face.boundingBox.maxX
+        var minY = face.boundingBox.minY
+        var maxY = face.boundingBox.maxY
+        
+        // 如果有特征点，使用特征点来扩展边界框
+        if let faceLandmarks = landmarks?.landmarks {
+            // 获取所有可用的特征点
+            var allPoints: [CGPoint] = []
+            
+            // 添加各种特征点
+            if let leftEye = faceLandmarks.leftEye {
+                allPoints.append(contentsOf: leftEye.normalizedPoints)
+            }
+            if let rightEye = faceLandmarks.rightEye {
+                allPoints.append(contentsOf: rightEye.normalizedPoints)
+            }
+            if let nose = faceLandmarks.nose {
+                allPoints.append(contentsOf: nose.normalizedPoints)
+            }
+            if let outerLips = faceLandmarks.outerLips {
+                allPoints.append(contentsOf: outerLips.normalizedPoints)
+            }
+            if let leftEyebrow = faceLandmarks.leftEyebrow {
+                allPoints.append(contentsOf: leftEyebrow.normalizedPoints)
+            }
+            if let rightEyebrow = faceLandmarks.rightEyebrow {
+                allPoints.append(contentsOf: rightEyebrow.normalizedPoints)
+            }
+            if let faceContour = faceLandmarks.faceContour {
+                allPoints.append(contentsOf: faceContour.normalizedPoints)
+            }
+            
+            // 找到所有特征点的极值
+            if !allPoints.isEmpty {
+                let pointMinX = allPoints.map { $0.x }.min() ?? minX
+                let pointMaxX = allPoints.map { $0.x }.max() ?? maxX
+                let pointMinY = allPoints.map { $0.y }.min() ?? minY
+                let pointMaxY = allPoints.map { $0.y }.max() ?? maxY
+                
+                // 扩展边界框（添加15%的边距）
+                let expandMargin: CGFloat = 0.15
+                let width = pointMaxX - pointMinX
+                let height = pointMaxY - pointMinY
+                
+                minX = max(0, pointMinX - width * expandMargin)
+                maxX = min(1, pointMaxX + width * expandMargin)
+                minY = max(0, pointMinY - height * expandMargin)
+                maxY = min(1, pointMaxY + height * expandMargin)
+            }
+        } else {
+            // 如果没有特征点，至少扩展原始边界框20%
+            let expandFactor: CGFloat = 0.20
+            let width = face.boundingBox.width
+            let height = face.boundingBox.height
+            
+            minX = max(0, face.boundingBox.minX - width * expandFactor)
+            maxX = min(1, face.boundingBox.maxX + width * expandFactor)
+            minY = max(0, face.boundingBox.minY - height * expandFactor)
+            maxY = min(1, face.boundingBox.maxY + height * expandFactor)
+        }
+        
+        return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+    }
+    
+    // MARK: - 转换边界框到屏幕坐标（考虑 resizeAspectFill 裁剪）
     private func convertBoundingBox(_ boundingBox: CGRect) -> CGRect {
         guard let previewLayer = previewLayer else { return boundingBox }
         
-        // 将 Vision 的归一化坐标转换为屏幕坐标
-        let rootLayerBounds = previewLayer.bounds
-        let transform = CGAffineTransform(scaleX: 1, y: -1)
-            .translatedBy(x: 0, y: -rootLayerBounds.height)
-            .scaledBy(x: rootLayerBounds.width, y: rootLayerBounds.height)
+        // 获取预览层尺寸
+        let layerWidth = previewLayer.bounds.width
+        let layerHeight = previewLayer.bounds.height
+        let layerAspectRatio = layerWidth / layerHeight
         
-        return boundingBox.applying(transform)
+        // 相机传感器通常是 4:3 (1.33)
+        let sensorAspectRatio: CGFloat = 4.0 / 3.0
+        
+        // 计算 resizeAspectFill 的缩放和偏移
+        var scaleX: CGFloat = 1.0
+        var scaleY: CGFloat = 1.0
+        var offsetX: CGFloat = 0.0
+        var offsetY: CGFloat = 0.0
+        
+        if layerAspectRatio > sensorAspectRatio {
+            // 屏幕更宽（如 19.5:9），图片高度填满，宽度超出
+            scaleY = layerHeight
+            scaleX = layerHeight * sensorAspectRatio
+            offsetX = (layerWidth - scaleX) / 2
+        } else {
+            // 屏幕更窄（少见），图片宽度填满，高度超出
+            scaleX = layerWidth
+            scaleY = layerWidth / sensorAspectRatio
+            offsetY = (layerHeight - scaleY) / 2
+        }
+        
+        // Vision 坐标系：原点在左下角，需要翻转 Y 轴
+        let x = boundingBox.minX * scaleX + offsetX
+        let y = (1.0 - boundingBox.maxY) * scaleY + offsetY
+        let width = boundingBox.width * scaleX
+        let height = boundingBox.height * scaleY
+        
+        return CGRect(x: x, y: y, width: width, height: height)
     }
     
     // MARK: - 更新当前帧

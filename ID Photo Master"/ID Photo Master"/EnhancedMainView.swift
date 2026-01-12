@@ -193,7 +193,7 @@ struct EnhancedMainView: View {
             roll: faceData.roll,
             pitch: faceData.pitch,
             faceDetected: faceDetected,
-            faceBoundingBox: faceData.boundingBox,
+            faceBoundingBox: faceData.normalizedBoundingBox,  // 使用归一化坐标
             faceLandmarks: faceData.faceLandmarks
         )
     }

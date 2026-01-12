@@ -123,28 +123,40 @@ class PhotoProcessor: ObservableObject {
         isProcessing = true
         
         DispatchQueue.global(qos: .userInitiated).async {
-            // 1. 人像分割
-            guard let segmentedMask = self.segmentPerson(from: image) else {
-                print("⚠️ 人像分割失败，返回原图")
+            // 0. WYSIWYG 裁剪 - 确保"所见即所得"
+            guard let croppedToScreen = self.cropToScreenAspectRatio(image) else {
+                print("⚠️ WYSIWYG 裁剪失败，使用原图")
                 DispatchQueue.main.async {
                     self.isProcessing = false
-                    completion(image) // 返回原图而不是 nil
+                    completion(image)
+                }
+                return
+            }
+            
+            print("✅ WYSIWYG 裁剪成功，裁剪后尺寸: \(croppedToScreen.size)")
+            
+            // 1. 人像分割（使用裁剪后的图片）
+            guard let segmentedMask = self.segmentPerson(from: croppedToScreen) else {
+                print("⚠️ 人像分割失败，返回裁剪后的图")
+                DispatchQueue.main.async {
+                    self.isProcessing = false
+                    completion(croppedToScreen)
                 }
                 return
             }
             
             print("✅ 人像分割成功")
             
-            // 2. 背景替换
+            // 2. 背景替换（使用裁剪后的图片）
             guard let backgroundReplaced = self.replaceBackground(
-                image: image,
+                image: croppedToScreen,
                 mask: segmentedMask,
                 backgroundColor: self.selectedBackground
             ) else {
-                print("⚠️ 背景替换失败，返回原图")
+                print("⚠️ 背景替换失败，返回裁剪后的图")
                 DispatchQueue.main.async {
                     self.isProcessing = false
-                    completion(image) // 返回原图
+                    completion(croppedToScreen)
                 }
                 return
             }
@@ -172,6 +184,48 @@ class PhotoProcessor: ObservableObject {
                 completion(croppedImage)
             }
         }
+    }
+    
+    // MARK: - WYSIWYG 裁剪（所见即所得）
+    private func cropToScreenAspectRatio(_ image: UIImage) -> UIImage? {
+        guard let cgImage = image.cgImage else { return nil }
+        
+        // 获取屏幕宽高比
+        let screenBounds = UIScreen.main.bounds
+        let screenAspectRatio = screenBounds.width / screenBounds.height
+        
+        // 获取图片尺寸
+        let imageWidth = CGFloat(cgImage.width)
+        let imageHeight = CGFloat(cgImage.height)
+        let imageAspectRatio = imageWidth / imageHeight
+        
+        print("📱 屏幕比例: \(screenAspectRatio), 图片比例: \(imageAspectRatio)")
+        
+        // 计算裁剪区域（Center Crop）
+        var cropRect: CGRect
+        
+        if imageAspectRatio > screenAspectRatio {
+            // 图片更宽，裁剪宽度
+            let targetWidth = imageHeight * screenAspectRatio
+            let xOffset = (imageWidth - targetWidth) / 2
+            cropRect = CGRect(x: xOffset, y: 0, width: targetWidth, height: imageHeight)
+        } else {
+            // 图片更高（通常是这种情况：4:3 vs 屏幕的 19.5:9）
+            // 裁剪高度，保持宽度
+            let targetHeight = imageWidth / screenAspectRatio
+            let yOffset = (imageHeight - targetHeight) / 2
+            cropRect = CGRect(x: 0, y: yOffset, width: imageWidth, height: targetHeight)
+        }
+        
+        print("✂️ 裁剪区域: \(cropRect)")
+        
+        // 执行裁剪
+        guard let croppedCGImage = cgImage.cropping(to: cropRect) else {
+            return nil
+        }
+        
+        // 转换回 UIImage，保持原始 scale 和 orientation
+        return UIImage(cgImage: croppedCGImage, scale: image.scale, orientation: image.imageOrientation)
     }
     
     // MARK: - 人像分割

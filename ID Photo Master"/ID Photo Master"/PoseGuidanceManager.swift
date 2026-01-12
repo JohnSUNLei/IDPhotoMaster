@@ -37,14 +37,48 @@ class PoseGuidanceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelega
     private var perfectStateStartTime: Date?
     private let perfectThreshold: TimeInterval = 1.0 // 完美姿势持续时间阈值
     
-    // 严格的证件照角度阈值（度）
-    private let yawThreshold: Double = 3.0      // 左右偏转（严格：露出双耳）
-    private let rollThreshold: Double = 2.0     // 头部倾斜（严格：头摆正）
-    private let pitchThreshold: Double = 5.0    // 抬头低头
+    // 提示语防抖动（增强版）
+    private var lastGuidanceUpdateTime = Date.distantPast
+    private var pendingGuidanceText: String = ""
+    private var pendingGuidanceState: PoseState = .noFaceDetected
+    private let guidanceUpdateThreshold: TimeInterval = 3.0  // 提示语更新最小间隔（3秒）
+    private let guidanceStableThreshold: TimeInterval = 1.0  // 状态稳定时间（1秒）
+    private var stateStableStartTime: Date?
+    private var lastStableState: PoseState = .noFaceDetected
     
-    // 人脸大小阈值（占屏幕比例）
-    private let minFaceSize: Double = 0.30      // 最小30%
-    private let maxFaceSize: Double = 0.50      // 最大50%
+    // 错误优先级（用于只播报最关键的问题）
+    private enum ErrorPriority: Int {
+        case noFace = 0
+        case tooFar = 1
+        case tooClose = 2
+        case positionWrong = 3
+        case angleWrong = 4
+        case shoulderCut = 5  // 最低优先级
+    }
+    
+    // ICAO 国际证件照标准阈值（放宽以匹配UI引导框）
+    // A. 头部大小（Face Size / Zoom Level）- 放宽阈值
+    private let minScreenFaceHeightRatio: Double = 0.45  // 45% 屏幕可见高度（放宽）
+    private let maxScreenFaceHeightRatio: Double = 0.75  // 75% 屏幕可见高度（放宽）
+    private let idealMinFaceHeightRatio: Double = 0.50   // 50% 理想最小
+    private let idealMaxFaceHeightRatio: Double = 0.70   // 70% 理想最大
+    
+    // B. 头顶留白（Headroom / Top Margin）- 放宽
+    private let minHeadroomRatio: Double = 0.05    // 5% 最小留白（放宽）
+    private let maxHeadroomRatio: Double = 0.25    // 25% 最大留白（放宽）
+    private let idealHeadroomMin: Double = 0.08    // 8% 理想最小
+    private let idealHeadroomMax: Double = 0.18    // 18% 理想最大
+    
+    // C. 水平居中（Horizontal Centering）- 放宽
+    private let horizontalCenterTolerance: Double = 0.08  // 8% 容差（放宽）
+    
+    // D. 肩膀可视区（已禁用）
+    // 前置摄像头视野有限，不再强制要求肩膀完全可见
+    
+    // 角度阈值（放宽标准）
+    private let yawThreshold: Double = 5.0      // 左右偏转（放宽）
+    private let rollThreshold: Double = 3.0     // 头部倾斜（放宽）
+    private let pitchThreshold: Double = 8.0    // 抬头低头（放宽）
     
     // MARK: - 初始化
     override init() {
@@ -52,9 +86,9 @@ class PoseGuidanceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         speechSynthesizer.delegate = self
     }
     
-    // MARK: - 更新姿势状态
+    // MARK: - 更新姿势状态（ICAO标准）
     func updatePose(yaw: Double?, roll: Double?, pitch: Double?, faceDetected: Bool, faceBoundingBox: CGRect? = nil, faceLandmarks: VNFaceLandmarks2D? = nil) {
-        guard faceDetected else {
+        guard faceDetected, let faceBox = faceBoundingBox else {
             setPoseState(.noFaceDetected, text: "请将脸部对准框内")
             return
         }
@@ -64,59 +98,74 @@ class PoseGuidanceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         let rollDegrees = abs((roll ?? 0) * 180 / .pi)
         let pitchDegrees = abs((pitch ?? 0) * 180 / .pi)
         
-        // 严格的证件照检测标准
-        var validationErrors: [String] = []
+        // ICAO 国际证件照标准校验（只报告最关键的一个问题）
+        var criticalError: (priority: ErrorPriority, message: String)? = nil
         
-        // 1. 检查人脸大小（距离）
-        if let faceBox = faceBoundingBox {
-            let faceArea = faceBox.width * faceBox.height
-            if faceArea < minFaceSize {
-                validationErrors.append("请靠近一点")
-            } else if faceArea > maxFaceSize {
-                validationErrors.append("请离远一点")
+        // ===== 核心构图标准 (Composition Standards) =====
+        
+        // A. 头部大小（Face Size / Zoom Level）- 最高优先级
+        let visibleHeightFactor = calculateVisibleHeightFactor()
+        let screenFaceHeightRatio = faceBox.height / visibleHeightFactor
+        
+        if screenFaceHeightRatio < minScreenFaceHeightRatio {
+            criticalError = (.tooFar, "太远了，请靠近一点")
+        } else if screenFaceHeightRatio > maxScreenFaceHeightRatio {
+            criticalError = (.tooClose, "太近了，请离远一点")
+        }
+        
+        // 如果距离有问题，其他问题都不重要了
+        if criticalError == nil {
+            // B. 头顶留白（Headroom / Top Margin）
+            let headroom = 1.0 - faceBox.maxY
+            if headroom < minHeadroomRatio {
+                criticalError = (.positionWrong, "头顶太高，请下移")
+            } else if headroom > maxHeadroomRatio {
+                criticalError = (.positionWrong, "头顶太低，请上移")
             }
         }
         
-        // 2. 检查双眉可见性
-        if let landmarks = faceLandmarks {
-            if landmarks.leftEyebrow == nil || landmarks.rightEyebrow == nil {
-                validationErrors.append("请露出眉毛")
-            }
-            
-            // 3. 检查瞳孔注视（眼睛居中）
-            if let leftPupil = landmarks.leftPupil, let rightPupil = landmarks.rightPupil,
-               let leftEye = landmarks.leftEye, let rightEye = landmarks.rightEye {
-                // 检查瞳孔是否在眼睛中心
-                if !isPupilCentered(pupil: leftPupil, eye: leftEye) || !isPupilCentered(pupil: rightPupil, eye: rightEye) {
-                    validationErrors.append("请注视摄像头")
+        // C. 水平居中（Horizontal Centering）
+        if criticalError == nil {
+            let horizontalCenter = faceBox.midX
+            let horizontalDeviation = abs(horizontalCenter - 0.5)
+            if horizontalDeviation > horizontalCenterTolerance * 1.5 {  // 放宽容差
+                if horizontalCenter < 0.5 {
+                    criticalError = (.positionWrong, "请向右移")
+                } else {
+                    criticalError = (.positionWrong, "请向左移")
                 }
             }
         }
         
-        // 4. 检查角度（严格标准）
-        let isYawPerfect = yawDegrees <= yawThreshold
-        let isRollPerfect = rollDegrees <= rollThreshold
-        let isPitchPerfect = pitchDegrees <= pitchThreshold
+        // D. 肩膀可视区（放宽要求，仅作为软警告）
+        // 不再阻止拍照，只在其他条件都满足时才提示
+        // 已注释掉，不再检查肩膀
         
-        if !isYawPerfect {
-            validationErrors.append("请正对镜头，露出双耳")
-        }
-        if !isRollPerfect {
-            validationErrors.append("请保持头部直立")
-        }
-        if !isPitchPerfect {
-            validationErrors.append("请平视镜头")
+        // ===== 角度标准（仅在位置正确后检查）=====
+        if criticalError == nil {
+            // 检查角度（放宽标准）
+            let isYawPerfect = yawDegrees <= yawThreshold * 1.5
+            let isRollPerfect = rollDegrees <= rollThreshold * 1.5
+            let isPitchPerfect = pitchDegrees <= pitchThreshold * 1.2
+            
+            if !isYawPerfect {
+                criticalError = (.angleWrong, "请正对镜头")
+            } else if !isRollPerfect {
+                criticalError = (.angleWrong, "请保持头部直立")
+            } else if !isPitchPerfect {
+                criticalError = (.angleWrong, "请平视镜头")
+            }
         }
         
-        // 5. 综合判断
-        if validationErrors.isEmpty {
+        // 5. 综合判断（只报告最关键的一个问题）
+        if let error = criticalError {
+            // 需要调整 - 只播报最关键的问题
+            handleAdjustmentNeeded(yawDegrees: yawDegrees, rollDegrees: rollDegrees, 
+                                 pitchDegrees: pitchDegrees, yaw: yaw, pitch: pitch, 
+                                 faceBoundingBox: faceBoundingBox, customGuidance: error.message)
+        } else {
             // 完美姿势
             handlePerfectPose()
-        } else {
-            // 需要调整
-            let guidance = validationErrors.joined(separator: "，")
-            handleAdjustmentNeeded(yawDegrees: yawDegrees, rollDegrees: rollDegrees, 
-                                 pitchDegrees: pitchDegrees, yaw: yaw, pitch: pitch, faceBoundingBox: faceBoundingBox, customGuidance: guidance)
         }
     }
     
@@ -252,9 +301,16 @@ class PoseGuidanceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelega
         return guidanceParts.joined(separator: "，")
     }
     
-    // MARK: - 检查并提供语音指导
+    // MARK: - 检查并提供语音指导（强制3秒间隔）
     private func checkAndProvideSpeechGuidance(guidance: String) {
         let now = Date()
+        
+        // 强制最小间隔检查（3秒）
+        let timeSinceLastSpoken = now.timeIntervalSince(lastGuidanceUpdateTime)
+        if timeSinceLastSpoken < guidanceUpdateThreshold {
+            // 还在冷却期，不播报
+            return
+        }
         
         // 检查是否在错误状态
         if errorStateStartTime == nil {
@@ -354,9 +410,37 @@ class PoseGuidanceManager: NSObject, ObservableObject, AVSpeechSynthesizerDelega
     
     // MARK: - 设置姿势状态
     private func setPoseState(_ state: PoseState, text: String) {
-        DispatchQueue.main.async {
-            self.currentPoseState = state
-            self.guidanceText = text
+        let now = Date()
+        
+        // 防抖动逻辑
+        // 1. 检查状态是否稳定
+        if state != lastStableState {
+            // 状态改变，重置稳定计时器
+            lastStableState = state
+            stateStableStartTime = now
+            pendingGuidanceState = state
+            pendingGuidanceText = text
+            return
+        }
+        
+        // 2. 状态稳定，检查是否达到稳定时间阈值
+        guard let stableStart = stateStableStartTime else {
+            stateStableStartTime = now
+            return
+        }
+        
+        let stableDuration = now.timeIntervalSince(stableStart)
+        
+        // 3. 检查是否可以更新UI
+        let timeSinceLastUpdate = now.timeIntervalSince(lastGuidanceUpdateTime)
+        
+        // 只有当状态稳定超过阈值，且距离上次更新超过最小间隔时，才更新UI
+        if stableDuration >= guidanceStableThreshold && timeSinceLastUpdate >= guidanceUpdateThreshold {
+            DispatchQueue.main.async {
+                self.currentPoseState = state
+                self.guidanceText = text
+            }
+            lastGuidanceUpdateTime = now
         }
     }
     
@@ -398,6 +482,39 @@ extension PoseGuidanceManager {
     
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
         // 语音被取消
+    }
+    
+    // MARK: - 计算可见高度因子（Visible Height Factor）
+    /// 计算屏幕可见区域相对于完整传感器图像的高度比例
+    /// 用于修正 resizeAspectFill 导致的坐标映射误差
+    private func calculateVisibleHeightFactor() -> Double {
+        // 获取屏幕尺寸
+        let screenBounds = UIScreen.main.bounds
+        let screenWidth = screenBounds.width
+        let screenHeight = screenBounds.height
+        let screenAspectRatio = screenWidth / screenHeight
+        
+        // 相机传感器通常是 4:3 (1.33)
+        let sensorAspectRatio: CGFloat = 4.0 / 3.0
+        
+        // 计算可见高度因子
+        // 当使用 resizeAspectFill 时：
+        // - 如果屏幕更窄（screenAspectRatio < sensorAspectRatio），图片宽度填满，高度超出
+        // - 如果屏幕更宽（screenAspectRatio > sensorAspectRatio），图片高度填满，宽度超出（少见）
+        
+        let visibleHeightFactor: CGFloat
+        
+        if screenAspectRatio < sensorAspectRatio {
+            // 竖屏情况（常见）：图片宽度填满屏幕，高度被裁剪
+            // 可见高度 = 屏幕宽度 / 传感器宽高比
+            // 可见高度占完整图像高度的比例 = (屏幕宽度 / 传感器宽高比) / 屏幕高度
+            visibleHeightFactor = (screenWidth / sensorAspectRatio) / screenHeight
+        } else {
+            // 横屏或方屏情况（少见）：图片高度填满屏幕
+            visibleHeightFactor = 1.0
+        }
+        
+        return Double(visibleHeightFactor)
     }
 }
 
